@@ -1,0 +1,8 @@
+# Trained model files are not stored in the repository (see README.md)
+runs/
+*.pt
+*.pth
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
