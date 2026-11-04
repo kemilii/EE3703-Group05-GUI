@@ -30,6 +30,7 @@ the training images. Uploads are processed in memory and never saved.
 | Path | Contents |
 |---|---|
 | `app.py` | Starts the GUI |
+| `download_models.py` | Downloads the trained models from the release into `runs/` |
 | `workbench_gui/server.py` | Local web server: serves the page, checks uploads, calls the chosen model, checks its output |
 | `workbench_gui/static/` | The page: upload button, model choice, results drawn on the photo |
 | `workbench_gui/adapters/` | One adapter per model, connecting the server to a trained run |
@@ -51,23 +52,21 @@ Requires Python 3.10+.
 pip install -r requirements.txt
 ```
 
-**Model files.** The trained checkpoints (about 150 MB each) are not stored here because they exceed GitHub's
-100 MB file limit. Each model needs two files from its training run, placed like this:
-
-```
-runs/<yolo run>/work/final_train/best.pt            (or work/train/best.pt, the development model)
-runs/<yolo run>/work/validation/evaluation_protocol.json
-runs/<faster r-cnn run>/work/final_train/best.pt
-runs/<faster r-cnn run>/work/validation/evaluation_protocol.json
-```
-
-Then start the GUI and open <http://127.0.0.1:8765>:
+Then download the trained models (about 140 MB each, from this repository's
+[release](https://github.com/kemilii/EE3703-Group05-GUI/releases/tag/models); they are too large to store in the
+repository itself) and start the GUI:
 
 ```sh
-python app.py --yolo-run runs/<yolo run> --frcnn-run runs/<faster r-cnn run>
+python download_models.py
+python app.py
 ```
 
-A model whose run is not given appears as "not connected". Add `--device cuda` to run on a GPU.
+Open <http://127.0.0.1:8765>, upload a photo and choose a model. Add `--device cuda` to run on a GPU.
+
+The models are saved as run folders in `runs/` (`runs/yolov2`, `runs/faster_rcnn`): each holds the checkpoint
+(`work/final_train/best.pt`, or `work/train/best.pt` for a development model) and the settings chosen on validation
+(`work/validation/evaluation_protocol.json`). Other run folders can be given with `--yolo-run` and `--frcnn-run`.
+A model that is missing shows as "not connected".
 
 Tests (no model files needed):
 
