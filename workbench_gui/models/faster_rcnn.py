@@ -33,48 +33,39 @@ INFERENCE_PROPOSALS = 600
 
 
 class RPN(nn.Module):
+    """Region proposal network head: for every anchor at every feature cell, an objectness logit and 4 box offsets.
+
+    A shared 3x3 convolution, then two 1x1 convolutions: (B, A, H, W) objectness and (B, 4A, H, W) offsets.
+    """
 
     def __init__(self, in_channels=256, num_anchors=55):
         super().__init__()
-
-        # Intermediate 3x3 convolution
-        self.rpn_head = nn.Sequential(
-            nn.Conv2d(
-                in_channels, in_channels,
-                kernel_size=3, stride=1, padding=1
-            ),
+        self.rpn_head = nn.Sequential(  # shared 3x3 convolution
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU()
         )
-
-        # Objectness classification head
-        self.cls_logits = nn.Conv2d(
-            in_channels, num_anchors,
-            kernel_size=1, stride=1
-        )
-
-        # Bounding box regression head
-        self.bbox_pred = nn.Conv2d(
-            in_channels, num_anchors * 4,
-            kernel_size=1, stride=1
-        )
+        self.cls_logits = nn.Conv2d(in_channels, num_anchors, kernel_size=1, stride=1)     # objectness per anchor
+        self.bbox_pred = nn.Conv2d(in_channels, num_anchors * 4, kernel_size=1, stride=1)  # (tx, ty, tw, th) per anchor
 
     def forward(self, x):
+        """Feature map (B, C, H, W) -> (objectness logits, box offsets)."""
         t = self.rpn_head(x)
         return self.cls_logits(t), self.bbox_pred(t)
 
+
 class Stage2_network(nn.Module):
+    """The second stage (RoI head): pools each proposal's features and classifies and refines it.
+
+    RoIAlign crops every proposal from the feature map to a fixed 7 x 7 grid; two fully connected layers of 1024
+    feed a 4-way classifier (background + 3 tools) and class-specific box offsets (4 per tool class).
+    """
 
     def __init__(self, in_channels=256, num_classes=4, *, stride=FEATURE_STRIDE, pool_size=ROI_POOL,
                  fc_layers=ROI_FC_LAYERS):
         super().__init__()
-
-        # Region of Interest (RoI) Align
-        self.roi_align = torchvision.ops.RoIAlign(
-            output_size=(pool_size, pool_size),
-            spatial_scale=1.0 / stride,
-            sampling_ratio=2,
-            aligned=True
-        )
+        # spatial_scale maps image-pixel boxes onto the stride-8 feature map
+        self.roi_align = torchvision.ops.RoIAlign(output_size=(pool_size, pool_size), spatial_scale=1.0 / stride,
+                                                  sampling_ratio=2, aligned=True)
 
         # Fully connected layers of 1024 (two, as in torchvision's Faster R-CNN head)
         layers, width = [], in_channels * pool_size ** 2
@@ -83,25 +74,16 @@ class Stage2_network(nn.Module):
             width = 1024
         self.fc = nn.Sequential(*layers)
 
-        # Classification head
-        self.cls_score = nn.Linear(
-            1024, num_classes
-        )
-
-        # Bounding box regression head
-        self.bbox_head = nn.Linear(
-            1024, (num_classes - 1) * 4
-        )
+        self.cls_score = nn.Linear(1024, num_classes)            # background + 3 tool classes
+        self.bbox_head = nn.Linear(1024, (num_classes - 1) * 4)  # box offsets for each tool class
 
     def forward(self, features, proposals):
-
+        """Feature map and a list of (N, 4) proposal boxes per image -> (class logits (N, 4), offsets (N, 12))."""
         pooled = self.roi_align(features, proposals)
-
         x = pooled.flatten(start_dim=1)
-
         x = self.fc(x)
-
         return self.cls_score(x), self.bbox_head(x)
+
 
 class FPNMerge(nn.Module):
     """Layer 3 (stride 16) upsampled and added to a 1x1 projection of layer 2 (stride 8), then a 3x3 smoothing
@@ -113,19 +95,21 @@ class FPNMerge(nn.Module):
         self.smooth = nn.Conv2d(coarse_channels, coarse_channels, kernel_size=3, padding=1)
 
     def forward(self, fine, coarse):
+        """Layer-2 map (B, 128, 80, 80) and layer-3 map (B, 256, 40, 40) -> merged map (B, 256, 80, 80)."""
         merged = self.lateral(fine) + F.interpolate(coarse, size=fine.shape[-2:], mode="nearest")
         return self.smooth(merged)
 
 
 class FasterRCNN_Modular(nn.Module):
+    """The complete Faster R-CNN: ResNet-18 backbone, feature merge, anchors, RPN and RoI head.
+
+    forward() runs stage 1 (backbone, anchors, RPN); the caller filters proposals (filter_proposals) and passes
+    them to forward_roi() for stage 2. Keeping the stages separate lets training sample RoIs between them.
+    """
 
     def __init__(self, num_classes, pretrained=True):
         super().__init__()
-
-        # STEP 2.3. CNN Backbone
-        backbone_model = resnet18(
-            weights=ResNet18_Weights.DEFAULT if pretrained else None
-        )
+        backbone_model = resnet18(weights=ResNet18_Weights.DEFAULT if pretrained else None)
 
         # ResNet-18 up to layer 2 (stride 8, 128 channels) and layer 3 (stride 16, 256 channels), merged by the neck
         # into one stride-8 map with 256 channels.
@@ -135,26 +119,13 @@ class FasterRCNN_Modular(nn.Module):
         self.neck = FPNMerge(128, 256)
         channels = 256
 
-        # STEP 2.4. Anchor Generator
-        # Use the same anchor count in the generator and both RPN heads.
-        self.anchor_generator = AnchorGenerator(
-          sizes=(ANCHOR_SIZES,),
-          aspect_ratios=(ASPECT_RATIOS,)
-        )
+        # 55 anchors per feature cell (11 sizes x 5 aspect ratios); the RPN predicts one output set per anchor
+        self.anchor_generator = AnchorGenerator(sizes=(ANCHOR_SIZES,), aspect_ratios=(ASPECT_RATIOS,))
+        self.rpn = RPN(in_channels=channels, num_anchors=self.anchor_generator.num_anchors_per_location()[0])
+        self.stage2 = Stage2_network(in_channels=channels, num_classes=num_classes)
 
-        # Assemble RPN and Stage 2 detector
-        self.rpn = RPN(
-            in_channels=channels,
-            num_anchors=self.anchor_generator.num_anchors_per_location()[0]
-        )
-
-        self.stage2 = Stage2_network(
-            in_channels=channels,
-            num_classes=num_classes,
-        )
         # Small initial weights for the output layers: objectness and class scores start near uniform
-        for layer in (self.rpn.cls_logits, self.rpn.bbox_pred,
-                      self.stage2.cls_score, self.stage2.bbox_head):
+        for layer in (self.rpn.cls_logits, self.rpn.bbox_pred, self.stage2.cls_score, self.stage2.bbox_head):
             nn.init.normal_(layer.weight, std=0.01)
             nn.init.zeros_(layer.bias)
 
@@ -163,130 +134,100 @@ class FasterRCNN_Modular(nn.Module):
         return [self.backbone, self.backbone_top]
 
     def new_parts(self):
+        """The layers trained from scratch (they get a higher learning rate)."""
         return [self.neck, self.rpn, self.stage2]
 
     def forward(self, images):
+        """Stage 1. A list of (3, 640, 640) images -> (features, anchors per image, RPN logits, RPN offsets)."""
+        image_sizes = [(img.shape[-2], img.shape[-1]) for img in images]
+        image_list = ImageList(torch.stack(images), image_sizes)  # the batch format the anchor generator expects
 
-        # STEP 2.5. Stage 1: Backbone + RPN forward pass
-
-        # Prepare ImageList for anchor generation
-        image_sizes = [
-            (img.shape[-2], img.shape[-1])
-            for img in images
-        ]
-
-        image_list = ImageList(
-            torch.stack(images),
-            image_sizes
-        )
-
-        # 1. Feature extraction
+        # 1. Feature extraction: layers 2 and 3 merged into the stride-8 map
         fine = self.backbone(image_list.tensors)
         features = self.neck(fine, self.backbone_top(fine))
 
-        # 2. Anchor generation
-        anchors = self.anchor_generator(
-            image_list,
-            [features]
-        )
+        # 2. Anchors: 55 per cell of the 80 x 80 map, in image pixels
+        anchors = self.anchor_generator(image_list, [features])
 
-        # 3. RPN predictions
+        # 3. RPN predictions for every anchor
         rpn_cls, rpn_reg = self.rpn(features)
-
         return features, anchors, rpn_cls, rpn_reg
 
     def forward_roi(self, features, proposals):
-
-        # STEP 2.5. Stage 2: RoI Head forward pass
+        """Stage 2: class logits and box offsets for the given proposals."""
         return self.stage2(features, proposals)
 
 
 def decode_boxes(ref_boxes, transforms, image_size=(640, 640), weights=None):
+    """Apply offsets (t_x, t_y, t_w, t_h) to reference boxes: the inverse of calculate_transforms.
+
+    Returns (xmin, ymin, xmax, ymax) boxes clipped to the image. tw, th are clamped so exp() stays finite.
+    """
     if weights is not None:  # undo the offset scaling of the box coder
         transforms = transforms / transforms.new_tensor(weights)
 
-    # Reference box dimensions and centres
+    # Reference box sizes and centres
     aw = (ref_boxes[:, 2] - ref_boxes[:, 0]).clamp(min=1.0)
     ah = (ref_boxes[:, 3] - ref_boxes[:, 1]).clamp(min=1.0)
-
     ax = ref_boxes[:, 0] + 0.5 * aw
     ay = ref_boxes[:, 1] + 0.5 * ah
 
-    # Predicted transforms
+    # Predicted offsets
     tx = transforms[:, 0]
     ty = transforms[:, 1]
     tw = transforms[:, 2].clamp(-4.0, 4.0)
     th = transforms[:, 3].clamp(-4.0, 4.0)
 
-    # Apply transforms
+    # New centre and size
     px = ax + aw * tx
     py = ay + ah * ty
     pw = aw * torch.exp(tw)
     ph = ah * torch.exp(th)
 
-    # Convert to (xmin, ymin, xmax, ymax)
-    refined_boxes = torch.stack([
-        px - 0.5 * pw,
-        py - 0.5 * ph,
-        px + 0.5 * pw,
-        py + 0.5 * ph
-    ], dim=1)
+    refined_boxes = torch.stack([px - 0.5 * pw, py - 0.5 * ph, px + 0.5 * pw, py + 0.5 * ph], dim=1)
 
-    # --- STEP 4.3. Clip Boundaries ---
+    # Clip to the image
     H, W = image_size
-
     refined_boxes[:, [0, 2]] = refined_boxes[:, [0, 2]].clamp(0, W)
     refined_boxes[:, [1, 3]] = refined_boxes[:, [1, 3]].clamp(0, H)
-
     return refined_boxes
+
 
 def filter_proposals(rpn_cls, rpn_reg, curr_anchors, image_size=(640, 640), *, limit=100, nms_iou=RPN_NMS_IOU,
                      pre_nms=None):
-    """The `limit` best proposals after NMS, from the `pre_nms` highest-scoring anchors (default 10 x limit)."""
+    """The `limit` best proposals after NMS, from the `pre_nms` highest-scoring anchors (default 10 x limit).
 
+    Returns the proposal boxes and their objectness probabilities. No gradients: proposals are inputs to stage 2.
+    """
     with torch.no_grad():
-
-        # Flatten RPN predictions
+        # 1. One score and one offset row per anchor
         scores = rpn_cls[0].permute(1, 2, 0).flatten()
         transforms = rpn_reg[0].permute(1, 2, 0).reshape(-1, 4)
 
-        # STEP 4.1. Select top-scoring anchors
+        # 2. Keep the highest-scoring anchors
         pre_nms_topk = min(pre_nms or 10 * limit, scores.numel())
-
         top_scores, top_idx = scores.topk(pre_nms_topk)
-
         top_anchors = curr_anchors[top_idx]
         top_transforms = transforms[top_idx]
 
-        # STEP 4.2. Refine bounding boxes
-        refined_boxes = decode_boxes(
-            top_anchors,
-            top_transforms,
-            image_size
-        )
-
-        # Remove invalid boxes
-        valid = (
-            torch.isfinite(refined_boxes).all(dim=1)
-            & (refined_boxes[:, 2] > refined_boxes[:, 0])
-            & (refined_boxes[:, 3] > refined_boxes[:, 1])
-        )
-
+        # 3. Turn them into boxes and drop invalid ones
+        refined_boxes = decode_boxes(top_anchors, top_transforms, image_size)
+        valid = (torch.isfinite(refined_boxes).all(dim=1)
+                 & (refined_boxes[:, 2] > refined_boxes[:, 0])
+                 & (refined_boxes[:, 3] > refined_boxes[:, 1]))
         refined_boxes = refined_boxes[valid]
         top_scores = top_scores[valid]
 
-        # STEP 4.4. Non-Maximum Suppression (NMS)
-        keep_idx = torchvision.ops.nms(
-            refined_boxes,
-            top_scores,
-            iou_threshold=nms_iou
-        )
-
+        # 4. Non-maximum suppression, then the `limit` best
+        keep_idx = torchvision.ops.nms(refined_boxes, top_scores, iou_threshold=nms_iou)
         keep_idx = keep_idx[:limit]
         return refined_boxes[keep_idx], top_scores[keep_idx].sigmoid()
 
 
 def decode_detections(proposals, probabilities, regression, image_size, score_floor, *, limit=100):
+    """Final detections from the RoI head: for each tool class, refine the proposals with that class's offsets,
+    keep scores >= score_floor and boxes wider and taller than 2 px, and apply class-wise NMS; then the `limit`
+    highest scores. Labels are detector classes 1-3."""
     boxes_out, scores_out, labels_out = [], [], []
     for label in range(1, 4):
         scores = probabilities[:, label]
