@@ -52,7 +52,7 @@ Requires Python 3.10+.
 pip install -r requirements.txt
 ```
 
-Then download the trained models (about 140 MB each, from this repository's
+Then download the trained models (about 140 MB for YOLOv2 and 70 MB for Faster R-CNN, from this repository's
 [release](https://github.com/kemilii/EE3703-Group05-GUI/releases/tag/models); they are too large to store in the
 repository itself) and start the GUI:
 
