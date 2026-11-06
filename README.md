@@ -26,6 +26,8 @@ browser draws them over the photo
 Each detector uses the **confidence threshold and NMS IoU chosen on validation** during training
 (saved in the run's `evaluation_protocol.json`). Photos go through the same letterboxing and normalization as
 the training images. Uploads are processed in memory and never saved.
+Exception: Faster R-CNN's final NMS IoU is 0.30, lowered from its untuned default of 0.50 after the final test to
+remove duplicate and partial boxes (see the report, Section 7.3).
 
 | Path | Contents |
 |---|---|

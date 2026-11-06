@@ -27,7 +27,7 @@ BOX_BETA = 1 / 9
 RPN_BOX_LAMBDA = 10.0               # weight of the RPN box loss
 RPN_POSITIVE_IOU = 0.60             # an anchor overlapping an object above this IoU is foreground
 RPN_NMS_IOU = 0.70
-FINAL_NMS_IOU = 0.30 #change made after doing extensive testing 
+FINAL_NMS_IOU = 0.30                # lowered from the untuned 0.50 after the final test, to remove duplicate and partial boxes (report Section 7.3)
 TRAIN_PROPOSALS = 600
 INFERENCE_PROPOSALS = 600
 
